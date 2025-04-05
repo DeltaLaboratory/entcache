@@ -6,12 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/gob"
 	"errors"
-	"fmt"
-	"sync"
 	"time"
-
-	"github.com/golang/groupcache/lru"
-	"github.com/redis/rueidis"
 )
 
 type (
@@ -34,6 +29,8 @@ type Entry struct {
 }
 
 // MarshalBinary implements the encoding.BinaryMarshaler interface.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (e Entry) MarshalBinary() ([]byte, error) {
 	entry := struct {
 		C []string
@@ -50,6 +47,8 @@ func (e Entry) MarshalBinary() ([]byte, error) {
 }
 
 // UnmarshalBinary implements the encoding.BinaryUnmarshaler interface.
+//
+//goland:noinspection GoMixedReceiverTypes
 func (e *Entry) UnmarshalBinary(buf []byte) error {
 	var entry struct {
 		C []string
@@ -67,127 +66,12 @@ func (e *Entry) UnmarshalBinary(buf []byte) error {
 var ErrNotFound = errors.New("entcache: entry was not found")
 
 type (
-	// LRU provides an LRU cache that implements the AddGetter interface.
-	LRU struct {
-		mu sync.Mutex
-		*lru.Cache
-	}
 	// entry wraps the Entry with additional expiry information.
 	entry struct {
 		*Entry
 		expiry time.Time
 	}
 )
-
-// NewLRU creates a new Cache.
-// If maxEntries is zero, the cache has no limit.
-func NewLRU(maxEntries int) *LRU {
-	return &LRU{
-		Cache: lru.New(maxEntries),
-	}
-}
-
-// Add adds the entry to the cache.
-func (l *LRU) Add(_ context.Context, k Key, e *Entry, ttl time.Duration) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	buf, err := e.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	ne := &Entry{}
-	if err := ne.UnmarshalBinary(buf); err != nil {
-		return err
-	}
-	if ttl == 0 {
-		l.Cache.Add(k, ne)
-	} else {
-		l.Cache.Add(k, &entry{Entry: ne, expiry: time.Now().Add(ttl)})
-	}
-	return nil
-}
-
-// Get gets an entry from the cache.
-func (l *LRU) Get(_ context.Context, k Key) (*Entry, error) {
-	l.mu.Lock()
-	e, ok := l.Cache.Get(k)
-	l.mu.Unlock()
-	if !ok {
-		return nil, ErrNotFound
-	}
-	switch e := e.(type) {
-	case *Entry:
-		return e, nil
-	case *entry:
-		if time.Now().Before(e.expiry) {
-			return e.Entry, nil
-		}
-		l.mu.Lock()
-		l.Cache.Remove(k)
-		l.mu.Unlock()
-		return nil, ErrNotFound
-	default:
-		return nil, fmt.Errorf("entcache: unexpected entry type: %T", e)
-	}
-}
-
-// Del deletes an entry from the cache.
-func (l *LRU) Del(_ context.Context, k Key) error {
-	l.mu.Lock()
-	l.Cache.Remove(k)
-	l.mu.Unlock()
-	return nil
-}
-
-// Redis provides a remote cache backed by Redis
-// and implements the SetGetter interface.
-type Redis struct {
-	c rueidis.Client
-}
-
-// NewRedis returns a new Redis cache level from the given Redis connection.
-func NewRedis(c rueidis.Client) *Redis {
-	return &Redis{c: c}
-}
-
-// Add adds the entry to the cache.
-func (r *Redis) Add(ctx context.Context, k Key, e *Entry, ttl time.Duration) error {
-	key := fmt.Sprint(k)
-	if key == "" {
-		return nil
-	}
-	buf, err := e.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	return r.c.Do(ctx, r.c.B().Set().Key(key).Value(rueidis.BinaryString(buf)).Ex(ttl).Build()).Error()
-}
-
-// Get gets an entry from the cache.
-func (r *Redis) Get(ctx context.Context, k Key) (*Entry, error) {
-	key := fmt.Sprint(k)
-	if key == "" {
-		return nil, ErrNotFound
-	}
-	buf, err := r.c.Do(ctx, r.c.B().Get().Key(key).Build()).AsBytes()
-	if err != nil || len(buf) == 0 {
-		return nil, ErrNotFound
-	}
-	e := &Entry{}
-	if err := e.UnmarshalBinary(buf); err != nil {
-		return nil, err
-	}
-	return e, nil
-}
-
-// Del deletes an entry from the cache.
-func (r *Redis) Del(ctx context.Context, k Key) error {
-	key := fmt.Sprint(k)
-	if key == "" {
-		return nil
-	}
-	return r.c.Do(ctx, r.c.B().Del().Key(key).Build()).Error()
-}
 
 // multiLevel provides a multi-level cache implementation.
 type multiLevel struct {
