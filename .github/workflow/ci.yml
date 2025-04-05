@@ -1,5 +1,15 @@
 name: Continuous Integration
-on: [push, pull_request]
+
+on:
+  pull_request:
+  push:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -11,10 +21,9 @@ jobs:
         with:
           go-version: 'stable'
       - name: Run linters
-        uses: golangci/golangci-lint-action@v2.5.2
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: v1.41.1
-          args: --timeout 3m
+          version: latest
   test:
     runs-on: ubuntu-latest
     steps:

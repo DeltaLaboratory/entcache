@@ -59,7 +59,7 @@ func (l *LRU) Get(_ context.Context, k Key) (*Entry, error) {
 			return e.Entry, nil
 		}
 		l.mu.Lock()
-		l.Cache.Remove(k)
+		l.Remove(k)
 		l.mu.Unlock()
 		return nil, ErrNotFound
 	default:
@@ -70,7 +70,7 @@ func (l *LRU) Get(_ context.Context, k Key) (*Entry, error) {
 // Del deletes an entry from the cache.
 func (l *LRU) Del(_ context.Context, k Key) error {
 	l.mu.Lock()
-	l.Cache.Remove(k)
+	l.Remove(k)
 	l.mu.Unlock()
 	return nil
 }

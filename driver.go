@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-	_ "unsafe"
+	_ "unsafe" // to link convertAssign
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
@@ -185,7 +185,7 @@ func (d *Driver) QueryContext(ctx context.Context, query string, args ...any) (*
 		QueryContext(context.Context, string, ...any) (*stdsql.Rows, error)
 	})
 	if !ok {
-		return nil, fmt.Errorf("Driver.QueryContext is not supported")
+		return nil, errors.New("Driver.QueryContext is not supported")
 	}
 	return drv.QueryContext(ctx, query, args...)
 }
@@ -196,7 +196,7 @@ func (d *Driver) ExecContext(ctx context.Context, query string, args ...any) (st
 		ExecContext(context.Context, string, ...any) (stdsql.Result, error)
 	})
 	if !ok {
-		return nil, fmt.Errorf("Driver.ExecContext is not supported")
+		return nil, errors.New("Driver.ExecContext is not supported")
 	}
 	return drv.ExecContext(ctx, query, args...)
 }
@@ -334,7 +334,7 @@ func (r *recorder) Close() error {
 	}
 	// If we did not encounter any error during iteration,
 	// and we scanned all rows, we store it on cache.
-	if err := r.ColumnScanner.Err(); err == nil || r.done {
+	if err := r.Err(); err == nil || r.done {
 		r.onClose(r.columns, r.values)
 	}
 	return nil
@@ -350,7 +350,7 @@ func (*repeater) Close() error {
 	return nil
 }
 func (*repeater) ColumnTypes() ([]*stdsql.ColumnType, error) {
-	return nil, fmt.Errorf("entcache.ColumnTypes is not supported")
+	return nil, errors.New("entcache.ColumnTypes is not supported")
 }
 func (r *repeater) Columns() ([]string, error) {
 	return r.columns, nil
