@@ -29,37 +29,37 @@ func FromContext(ctx context.Context) (AddGetDeleter, bool) {
 
 // ctxOptions allows injecting runtime options.
 type ctxOptions struct {
-	skip  bool          // i.e. skip entry.
-	evict bool          // i.e. skip and invalidate entry.
+	cache bool          // i.e. cache entry.
+	evict bool          // i.e. cache and invalidate entry.
 	key   Key           // entry key.
 	ttl   time.Duration // entry duration.
 }
 
 var ctxOptionsKey ctxOptions
 
-// Skip returns a new Context that tells the Driver
-// to skip the cache entry on Query.
+// Cache returns a new Context that tells the Driver
+// to cache the cache entry on Query.
 //
-//	client.T.Query().All(entcache.Skip(ctx))
-func Skip(ctx context.Context) context.Context {
+//	client.T.Query().All(entcache.Cache(ctx))
+func Cache(ctx context.Context) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{skip: true})
+		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{cache: true})
 	}
-	c.skip = true
+	c.cache = true
 	return ctx
 }
 
 // Evict returns a new Context that tells the Driver
-// to skip and invalidate the cache entry on Query.
+// to cache and invalidate the cache entry on Query.
 //
 //	client.T.Query().All(entcache.Evict(ctx))
 func Evict(ctx context.Context) context.Context {
 	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
 	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{skip: true, evict: true})
+		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{cache: true, evict: true})
 	}
-	c.skip = true
+	c.cache = true
 	c.evict = true
 	return ctx
 }

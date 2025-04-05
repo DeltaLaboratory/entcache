@@ -210,6 +210,7 @@ func (d *Driver) optionsFromContext(ctx context.Context, query string, args []an
 	if c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions); ok {
 		opts = *c
 	}
+
 	if opts.key == nil {
 		key, err := d.Hash(query, args)
 		if err != nil {
@@ -217,17 +218,21 @@ func (d *Driver) optionsFromContext(ctx context.Context, query string, args []an
 		}
 		opts.key = key
 	}
+
 	if opts.ttl == 0 {
 		opts.ttl = d.TTL
 	}
+
 	if opts.evict {
 		if err := d.Cache.Del(ctx, opts.key); err != nil {
 			return opts, err
 		}
 	}
-	if opts.skip {
+
+	if !opts.cache {
 		return opts, errSkip
 	}
+
 	return opts, nil
 }
 
@@ -244,6 +249,7 @@ func DefaultHash(query string, args []any) (Key, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return key, nil
 }
 
