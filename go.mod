@@ -10,7 +10,7 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/mitchellh/hashstructure/v2 v2.0.2
 	github.com/redis/rueidis v1.0.67
-	github.com/redis/rueidis/mock v1.0.56
+	github.com/redis/rueidis/mock v1.0.67
 	go.uber.org/mock v0.5.0
 )
 
