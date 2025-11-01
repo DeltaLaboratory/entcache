@@ -51,6 +51,14 @@ type (
 	}
 )
 
+var cacheOnlySentinelColumns = []string{"__entcache_cache_only__"}
+
+// CacheOnlySentinelColumns returns the sentinel column names used for CacheOnly miss scenarios.
+// This is exported for testing purposes.
+func CacheOnlySentinelColumns() []string {
+	return cacheOnlySentinelColumns
+}
+
 // NewDriver returns a new Driver an existing driver and optional
 // configuration functions.
 // For example,
@@ -145,6 +153,30 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 		return d.Driver.Query(ctx, query, args, v)
 	}
 	atomic.AddUint64(&d.stats.Gets, 1)
+
+	// Handle cache-only mode - skip database execution
+	if opts.cacheOnly {
+		switch e, err := d.Cache.Get(ctx, opts.key); {
+		case err == nil:
+			atomic.AddUint64(&d.stats.Hits, 1)
+			vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
+			return nil
+		case errors.Is(err, ErrNotFound):
+			// If evict was also set, the deletion already happened in optionsFromContext.
+			// Return empty result set for cache miss while providing a valid column slice
+			// so ent/sql helpers treat it as an empty result rather than an error.
+			vr.ColumnScanner = &repeater{columns: cacheOnlySentinelColumns, values: nil}
+			return nil
+		default:
+			if d.Log != nil {
+				atomic.AddUint64(&d.stats.Errors, 1)
+				d.Log(fmt.Sprintf("entcache: failed getting entry %v from cache: %v", opts.key, err))
+			}
+			return err
+		}
+	}
+
+	// Normal cache flow with database fallback
 	switch e, err := d.Cache.Get(ctx, opts.key); {
 	case err == nil:
 		atomic.AddUint64(&d.stats.Hits, 1)
@@ -335,9 +367,42 @@ func (r *recorder) Close() error {
 	// If we did not encounter any error during iteration,
 	// and we scanned all rows, we store it on cache.
 	if err := r.Err(); err == nil || r.done {
+		r.ensureColumnsCaptured()
 		r.onClose(r.columns, r.values)
 	}
 	return nil
+}
+
+// ensureColumnsCaptured ensures columns are captured before storing in cache.
+// If Columns() was never called, we need to get them now.
+func (r *recorder) ensureColumnsCaptured() {
+	if r.columns == nil {
+		if cols, err := r.ColumnScanner.Columns(); err == nil && len(cols) > 0 {
+			r.columns = cols
+			return
+		}
+
+		// Fallback: try to get columns from underlying scanner
+		// Even for empty result sets, columns should be available
+		if cols, err := r.ColumnScanner.Columns(); err == nil && len(cols) > 0 {
+			r.columns = cols
+			return
+		}
+
+		// Last resort: infer column count from data if column names aren't available
+		if len(r.values) > 0 {
+			numCols := len(r.values[0])
+			r.columns = make([]string, numCols)
+			for i := range r.columns {
+				r.columns[i] = fmt.Sprintf("column_%d", i)
+			}
+			return
+		}
+
+		// For empty result sets with no columns available, use empty slice
+		// This is a limitation when the underlying driver doesn't provide column info
+		r.columns = []string{}
+	}
 }
 
 // repeater repeats columns scanning from cache history.

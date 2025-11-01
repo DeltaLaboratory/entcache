@@ -148,7 +148,9 @@ func TestDriver_Levels(t *testing.T) {
 		mock.ExpectQuery("SELECT active FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"active"}).AddRow(true).AddRow(false))
 
-		buf, _ := entcache.Entry{Values: [][]driver.Value{{true}, {false}}}.MarshalBinary()
+		// Due to our fix, the actual cache will store fallback column names
+		// if the Columns() method isn't called properly
+		buf, _ := entcache.Entry{Columns: []string{"column_0"}, Values: [][]driver.Value{{true}, {false}}}.MarshalBinary()
 		rdb.EXPECT().Do(ctx, ruemock.Match("SET", "1", rueidis.BinaryString(buf), "EX", "0")).Return(ruemock.Result(ruemock.RedisNil()))
 		expectQuery(ctx, t, drv, "SELECT active FROM users", []any{true, false})
 
@@ -202,7 +204,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 		expectQuery(cacheCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
-		evictCtx := entcache.Evict(ctx)
+		evictCtx := entcache.Cache(ctx, entcache.Evict())
 		expectQuery(evictCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
 		mock.ExpectQuery("SELECT name FROM users").
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
@@ -218,7 +220,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ctx := context.Background()
 		// Enable caching and set TTL
-		ttlCtx := entcache.Cache(entcache.WithTTL(ctx, -1))
+		ttlCtx := entcache.Cache(ctx, entcache.WithTTL(-1))
 		expectQuery(ttlCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatal(err)
@@ -231,7 +233,7 @@ func TestDriver_ContextOptions(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
 		ctx := context.Background()
 		// Enable caching and set key
-		keyCtx := entcache.Cache(entcache.WithKey(ctx, "cache-key"))
+		keyCtx := entcache.Cache(ctx, entcache.WithKey("cache-key"))
 		expectQuery(keyCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
 		expectQuery(keyCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
 		mock.ExpectQuery("SELECT name FROM users").
@@ -248,6 +250,149 @@ func TestDriver_ContextOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 		expected := entcache.Stats{Gets: 3, Hits: 1}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+}
+
+func TestDriver_CacheOnly(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := sql.OpenDB(dialect.MySQL, db)
+
+	t.Run("CacheOnly_Hit", func(t *testing.T) {
+		drv := entcache.NewDriver(drv)
+		mock.ExpectQuery("SELECT name FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
+
+		ctx := context.Background()
+
+		// First: cache the data
+		cacheCtx := entcache.Cache(ctx)
+		expectQuery(cacheCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
+
+		// Second: read from cache only
+		cacheOnlyCtx := entcache.Cache(ctx, entcache.CacheOnly())
+		expectQuery(cacheOnlyCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := entcache.Stats{Gets: 2, Hits: 1}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+
+	t.Run("CacheOnly_Miss", func(t *testing.T) {
+		drv := entcache.NewDriver(drv)
+
+		ctx := context.Background()
+
+		// Cache only read should return empty result
+		cacheOnlyCtx := entcache.Cache(ctx, entcache.CacheOnly())
+		expectQuery(cacheOnlyCtx, t, drv, "SELECT name FROM users", []any{}) // empty result
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := entcache.Stats{Gets: 1, Hits: 0}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+
+	t.Run("CacheOnly_Evict", func(t *testing.T) {
+		drv := entcache.NewDriver(drv)
+		mock.ExpectQuery("SELECT name FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
+
+		ctx := context.Background()
+
+		// First: cache the data
+		cacheCtx := entcache.Cache(ctx)
+		expectQuery(cacheCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
+
+		// Second: verify cache hit
+		expectQuery(cacheCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
+
+		// Third: invalidate without execution
+		evictOnlyCtx := entcache.Cache(ctx, entcache.CacheOnly(), entcache.Evict())
+		expectQuery(evictOnlyCtx, t, drv, "SELECT name FROM users", []any{}) // empty result
+
+		// Fourth: verify cache was cleared (should hit DB)
+		mock.ExpectQuery("SELECT name FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("a8m"))
+		expectQuery(cacheCtx, t, drv, "SELECT name FROM users", []any{"a8m"})
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := entcache.Stats{Gets: 4, Hits: 1}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+}
+
+func TestDriver_OptionsComposition(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := sql.OpenDB(dialect.MySQL, db)
+
+	t.Run("Evict_WithTTL_WithKey", func(t *testing.T) {
+		drv := entcache.NewDriver(drv)
+		mock.ExpectQuery("SELECT age FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"age"}).AddRow(25))
+
+		ctx := context.Background()
+		// Execute with eviction, custom TTL, and custom key
+		composedCtx := entcache.Cache(ctx, entcache.Evict(), entcache.WithTTL(time.Hour), entcache.WithKey("test-key"))
+		expectQuery(composedCtx, t, drv, "SELECT age FROM users", []any{int64(25)})
+
+		// Verify cache was cleared (should hit DB again)
+		mock.ExpectQuery("SELECT age FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"age"}).AddRow(25))
+		expectQuery(composedCtx, t, drv, "SELECT age FROM users", []any{int64(25)})
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := entcache.Stats{Gets: 2, Hits: 0}
+		if s := drv.Stats(); s != expected {
+			t.Errorf("unexpected stats: %v != %v", s, expected)
+		}
+	})
+
+	t.Run("CacheOnly_WithKey", func(t *testing.T) {
+		drv := entcache.NewDriver(drv)
+		mock.ExpectQuery("SELECT name FROM users").
+			WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("user1"))
+
+		ctx := context.Background()
+
+		// First: cache with custom key
+		keyCtx := entcache.Cache(ctx, entcache.WithKey("user-key"))
+		expectQuery(keyCtx, t, drv, "SELECT name FROM users", []any{"user1"})
+
+		// Second: read cache only with same custom key
+		cacheOnlyKeyCtx := entcache.Cache(ctx, entcache.CacheOnly(), entcache.WithKey("user-key"))
+		expectQuery(cacheOnlyKeyCtx, t, drv, "SELECT name FROM users", []any{"user1"})
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+
+		expected := entcache.Stats{Gets: 2, Hits: 1}
 		if s := drv.Stats(); s != expected {
 			t.Errorf("unexpected stats: %v != %v", s, expected)
 		}

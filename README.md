@@ -35,7 +35,7 @@ client := ent.NewClient(ent.Driver(drv))
 
 // Tell the entcache.Driver to skip the caching layer
 // when running the schema migration.
-if client.Schema.Create(entcache.Skip(ctx)); err != nil {
+if client.Schema.Create(ctx); err != nil {
 	log.Fatal("running schema migration", err)
 }
 
@@ -47,6 +47,89 @@ if u, err := client.User.Get(ctx, id); err != nil {
 if u, err := client.User.Get(ctx, id); err != nil {
 	log.Fatal("querying user", err)
 }
+```
+
+## Cache Control
+
+`entcache` provides a powerful options-based API for fine-grained cache control, allowing you to compose different caching behaviors:
+
+### Basic Usage
+
+```go
+// Enable caching
+ctx := entcache.Cache(ctx)
+users, err := client.User.Query().All(ctx)
+```
+
+### Custom Configuration
+
+```go
+// Cache with custom TTL (1 hour)
+ctx := entcache.Cache(ctx, entcache.WithTTL(time.Hour))
+
+// Cache with custom key
+ctx := entcache.Cache(ctx, entcache.WithKey("user-list"))
+
+// Execute query and invalidate cache immediately
+ctx := entcache.Cache(ctx, entcache.Evict())
+users, err := client.User.Query().All(ctx)
+```
+
+### Cache Inspection
+
+Read from cache without database fallback:
+
+```go
+// Read from cache only (returns empty result if not cached)
+ctx := entcache.Cache(ctx, entcache.CacheOnly())
+users, err := client.User.Query().All(ctx)
+if len(users) == 0 {
+    // Cache miss - no data available
+}
+```
+
+### Cache Invalidation
+
+Invalidate cache entries without executing the query:
+
+```go
+// Invalidate cache using the query-generated key (no DB execution)
+query := client.User.Query().Where(user.ID(123))
+ctx := entcache.Cache(ctx, entcache.CacheOnly(), entcache.Evict())
+_, _ = query.All(ctx) // Invalidates cache, doesn't execute DB query
+```
+
+### Composing Options
+
+The options pattern allows clean composition of multiple behaviors:
+
+```go
+// Complex: execute, cache with custom key, set TTL, then invalidate
+ctx := entcache.Cache(ctx,
+    entcache.WithKey("active-users"),
+    entcache.WithTTL(30*time.Minute),
+    entcache.Evict(),
+)
+users, err := client.User.Query().Where(user.Active(true)).All(ctx)
+
+// Cache-only read with custom key
+ctx := entcache.Cache(ctx,
+    entcache.CacheOnly(),
+    entcache.WithKey("user-profile-123"),
+)
+profile, err := client.User.Get(ctx, 123)
+```
+
+### Migration from Previous API
+
+If you were using the previous context-based API:
+
+```go
+// Old API (removed)
+ctx = entcache.Evict(entcache.WithTTL(entcache.WithKey(ctx, "key"), time.Hour))
+
+// New API (recommended)
+ctx = entcache.Cache(ctx, entcache.Evict(), entcache.WithTTL(time.Hour), entcache.WithKey("key"))
 ```
 
 **However**, you need to choose the cache storage carefully before adding `entcache` to your project.

@@ -29,63 +29,91 @@ func FromContext(ctx context.Context) (AddGetDeleter, bool) {
 
 // ctxOptions allows injecting runtime options.
 type ctxOptions struct {
-	cache bool          // i.e. cache entry.
-	evict bool          // i.e. cache and invalidate entry.
-	key   Key           // entry key.
-	ttl   time.Duration // entry duration.
+	cache     bool          // i.e. cache entry.
+	evict     bool          // i.e. cache and invalidate entry.
+	cacheOnly bool          // i.e. skip database execution, cache-only operation.
+	key       Key           // entry key.
+	ttl       time.Duration // entry duration.
 }
 
 var ctxOptionsKey ctxOptions
 
-// Cache returns a new Context that tells the Driver
-// to cache the cache entry on Query.
+// QueryOption configures cache behavior for a query.
+type QueryOption func(*ctxOptions)
+
+// CacheOnly configures the driver to skip database execution.
+// When used alone, reads from cache and returns empty result if not cached.
+// When combined with Evict(), invalidates the cache without executing the query.
 //
-//	client.T.Query().All(entcache.Cache(ctx))
-func Cache(ctx context.Context) context.Context {
-	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
-	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{cache: true})
+//	// Read from cache only (no DB fallback)
+//	users, err := client.User.Query().All(entcache.Cache(ctx, CacheOnly()))
+//
+//	// Invalidate without executing query
+//	_, err := client.User.Query().Where(...).All(entcache.Cache(ctx, CacheOnly(), Evict()))
+func CacheOnly() QueryOption {
+	return func(o *ctxOptions) {
+		o.cacheOnly = true
 	}
-	c.cache = true
-	return ctx
 }
 
-// Evict returns a new Context that tells the Driver
-// to cache and invalidate the cache entry on Query.
+// Evict invalidates the cache entry after determining its key.
+// When used alone, executes the query and invalidates the cached result.
+// When combined with CacheOnly(), invalidates without executing.
 //
-//	client.T.Query().All(entcache.Evict(ctx))
-func Evict(ctx context.Context) context.Context {
-	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
-	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{cache: true, evict: true})
+//	// Execute and invalidate
+//	users, err := client.User.Query().All(entcache.Cache(ctx, Evict()))
+//
+//	// Invalidate only (no execution)
+//	_, err := client.User.Query().Where(...).All(entcache.Cache(ctx, CacheOnly(), Evict()))
+func Evict() QueryOption {
+	return func(o *ctxOptions) {
+		o.evict = true
 	}
-	c.cache = true
-	c.evict = true
-	return ctx
 }
 
-// WithKey returns a new Context that carries the Key for the cache entry.
+// WithKey sets a custom cache key instead of generating one from the query.
 // Note that this option should not be used if the ent.Client query involves
 // more than 1 SQL query (e.g., eager loading).
 //
-//	client.T.Query().All(entcache.WithKey(ctx, "key"))
-func WithKey(ctx context.Context, key Key) context.Context {
-	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
-	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{key: key})
+//	users, err := client.User.Query().All(entcache.Cache(ctx, WithKey("my-key")))
+func WithKey(key Key) QueryOption {
+	return func(o *ctxOptions) {
+		o.key = key
 	}
-	c.key = key
-	return ctx
 }
 
-// WithTTL returns a new Context that carries the TTL for the cache entry.
+// WithTTL sets a custom TTL for this cache entry.
 //
-//	client.T.Query().All(entcache.WithTTL(ctx, time.Second))
-func WithTTL(ctx context.Context, ttl time.Duration) context.Context {
-	c, ok := ctx.Value(ctxOptionsKey).(*ctxOptions)
-	if !ok {
-		return context.WithValue(ctx, ctxOptionsKey, &ctxOptions{ttl: ttl})
+//	users, err := client.User.Query().All(entcache.Cache(ctx, WithTTL(time.Hour)))
+func WithTTL(ttl time.Duration) QueryOption {
+	return func(o *ctxOptions) {
+		o.ttl = ttl
 	}
-	c.ttl = ttl
-	return ctx
+}
+
+// Cache returns a context that enables caching for the query.
+// Accepts optional configuration via functional options.
+//
+// Examples:
+//
+//	// Basic caching
+//	ctx := entcache.Cache(ctx)
+//
+//	// With custom TTL
+//	ctx := entcache.Cache(ctx, WithTTL(time.Hour))
+//
+//	// Cache-only read (no DB fallback)
+//	ctx := entcache.Cache(ctx, CacheOnly())
+//
+//	// Invalidate without execution
+//	ctx := entcache.Cache(ctx, CacheOnly(), Evict())
+//
+//	// Execute, cache, and set custom key
+//	ctx := entcache.Cache(ctx, WithKey("my-key"), WithTTL(time.Minute))
+func Cache(ctx context.Context, opts ...QueryOption) context.Context {
+	o := &ctxOptions{cache: true}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return context.WithValue(ctx, ctxOptionsKey, o)
 }
