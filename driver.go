@@ -14,6 +14,7 @@ import (
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
 	"github.com/mitchellh/hashstructure/v2"
+	"golang.org/x/sync/singleflight"
 )
 
 type (
@@ -36,6 +37,12 @@ type (
 		// Logf function. If provided, the Driver will call it with
 		// errors that cannot be handled.
 		Log func(...any)
+
+		// Singleflight enables request coalescing for concurrent identical queries.
+		// When enabled, concurrent queries with the same cache key will be deduplicated,
+		// with only one query executed and the result shared among all callers.
+		// Default is false.
+		Singleflight bool
 	}
 
 	// Option allows configuring the cache
@@ -48,6 +55,7 @@ type (
 		dialect.Driver
 		*Options
 		stats Stats
+		group singleflight.Group
 	}
 )
 
@@ -125,12 +133,22 @@ func ContextLevel() Option {
 	}
 }
 
+// WithSingleflight enables or disables request coalescing for concurrent identical queries.
+// When enabled, if multiple goroutines request the same uncached query simultaneously,
+// only one will execute the database query and the result will be shared with all callers.
+// This prevents cache stampedes where many concurrent requests hit the database for the same data.
+func WithSingleflight(enabled bool) Option {
+	return func(o *Options) {
+		o.Singleflight = enabled
+	}
+}
+
 // Query implements the Querier interface for the driver. It falls back to the
 // underlying wrapped driver in case of caching error.
 //
-// Note that the driver does not synchronize identical queries that are executed
-// concurrently. Hence, if two identical queries are executed at the ~same time, and
-// there is no cache entry for them, the driver will execute both of them and the
+// Note that unless Singleflight is enabled, the driver does not synchronize identical queries
+// that are executed concurrently. Hence, if two identical queries are executed at the ~same time,
+// and there is no cache entry for them, the driver will execute both of them and the
 // last successful one will be stored in the cache.
 func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 	// Check if the given statement looks like a standard Ent query (e.g., SELECT).
@@ -182,6 +200,10 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 		atomic.AddUint64(&d.stats.Hits, 1)
 		vr.ColumnScanner = &repeater{columns: e.Columns, values: e.Values}
 	case errors.Is(err, ErrNotFound):
+		// Use singleflight if enabled to deduplicate concurrent identical queries
+		if d.Singleflight {
+			return d.queryWithSingleflight(ctx, query, argv, vr, opts)
+		}
 		if err := d.Driver.Query(ctx, query, args, vr); err != nil {
 			return err
 		}
@@ -204,10 +226,92 @@ func (d *Driver) Query(ctx context.Context, query string, args, v any) error {
 // Stats return a copy of the cache statistics.
 func (d *Driver) Stats() Stats {
 	return Stats{
-		Gets:   atomic.LoadUint64(&d.stats.Gets),
-		Hits:   atomic.LoadUint64(&d.stats.Hits),
-		Errors: atomic.LoadUint64(&d.stats.Errors),
+		Gets:      atomic.LoadUint64(&d.stats.Gets),
+		Hits:      atomic.LoadUint64(&d.stats.Hits),
+		Errors:    atomic.LoadUint64(&d.stats.Errors),
+		Coalesced: atomic.LoadUint64(&d.stats.Coalesced),
 	}
+}
+
+// materializeRows fully consumes a ColumnScanner and returns an Entry.
+// This is used by singleflight to eagerly load all rows so the result can be shared.
+func materializeRows(cs sql.ColumnScanner) (*Entry, error) {
+	columns, err := cs.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var values [][]driver.Value
+	numCols := len(columns)
+	for cs.Next() {
+		row := make([]driver.Value, numCols)
+		args := make([]any, numCols)
+		c := &rawCopy{values: row}
+		for i := range args {
+			args[i] = c
+		}
+		if err := cs.Scan(args...); err != nil {
+			return nil, err
+		}
+		values = append(values, row)
+	}
+
+	if err := cs.Err(); err != nil {
+		return nil, err
+	}
+
+	return &Entry{Columns: columns, Values: values}, nil
+}
+
+// queryWithSingleflight executes a query with singleflight protection.
+// Only one concurrent query for the same key will execute; others wait and share the result.
+func (d *Driver) queryWithSingleflight(ctx context.Context, query string, args []any, vr *sql.Rows, opts ctxOptions) error {
+	// Use string representation of the key for singleflight
+	sfKey := fmt.Sprint(opts.key)
+
+	// Use context.WithoutCancel so the query completes even if the first caller cancels.
+	// This benefits all waiters since the result will be cached.
+	queryCtx := context.WithoutCancel(ctx)
+
+	v, err, shared := d.group.Do(sfKey, func() (any, error) {
+		// Execute the query
+		var rows sql.Rows
+		if err := d.Driver.Query(queryCtx, query, args, &rows); err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		// Materialize all rows
+		entry, err := materializeRows(rows.ColumnScanner)
+		if err != nil {
+			return nil, err
+		}
+
+		// Cache the result
+		if err := d.Cache.Add(queryCtx, opts.key, entry, opts.ttl); err != nil {
+			if d.Log != nil {
+				atomic.AddUint64(&d.stats.Errors, 1)
+				d.Log(fmt.Sprintf("entcache: failed storing entry %v in cache: %v", opts.key, err))
+			}
+		}
+
+		return entry, nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if shared {
+		atomic.AddUint64(&d.stats.Coalesced, 1)
+	}
+
+	entry, ok := v.(*Entry)
+	if !ok {
+		return fmt.Errorf("entcache: unexpected singleflight result type %T", v)
+	}
+	vr.ColumnScanner = &repeater{columns: entry.Columns, values: entry.Values}
+	return nil
 }
 
 // QueryContext calls QueryContext of the underlying driver, or fails if it is not supported.
@@ -287,9 +391,10 @@ func DefaultHash(query string, args []any) (Key, error) {
 
 // Stats represent the cache statistics of the driver.
 type Stats struct {
-	Gets   uint64
-	Hits   uint64
-	Errors uint64
+	Gets      uint64
+	Hits      uint64
+	Errors    uint64
+	Coalesced uint64 // Number of queries that were coalesced via singleflight
 }
 
 // rawCopy copies the driver values by implementing

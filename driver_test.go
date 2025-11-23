@@ -445,3 +445,178 @@ func expectQuery(ctx context.Context, t *testing.T, drv dialect.Driver, query st
 		t.Fatal(err)
 	}
 }
+
+func TestDriver_Singleflight_CoalesceConcurrentQueries(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := sql.OpenDB(dialect.MySQL, db)
+
+	// Create driver with singleflight enabled
+	cachedDrv := entcache.NewDriver(drv, entcache.WithSingleflight(true), entcache.TTL(time.Minute))
+
+	// Expect only ONE database query despite multiple concurrent requests
+	mock.ExpectQuery("SELECT id FROM users").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"id"}).
+				AddRow(1).
+				AddRow(2).
+				AddRow(3),
+		).WillDelayFor(50 * time.Millisecond) // Add delay to ensure concurrency
+
+	ctx := entcache.Cache(context.Background())
+
+	const numGoroutines = 10
+	results := make(chan []any, numGoroutines)
+	errors := make(chan error, numGoroutines)
+
+	// Launch concurrent queries
+	for range numGoroutines {
+		go func() {
+			result, err := runQueryAndCollect(ctx, cachedDrv, "SELECT id FROM users")
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- result
+		}()
+	}
+
+	// Collect results
+	expected := []any{int64(1), int64(2), int64(3)}
+	collectAndVerifyResults(t, results, errors, numGoroutines, expected)
+
+	// Verify only one query was executed
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expected exactly one query, but: %v", err)
+	}
+
+	// Check stats
+	stats := cachedDrv.Stats()
+	if stats.Gets != numGoroutines {
+		t.Errorf("expected %d gets, got %d", numGoroutines, stats.Gets)
+	}
+	// Coalesced counts all queries that received a shared result (all 10 in this case)
+	if stats.Coalesced != numGoroutines {
+		t.Errorf("expected %d coalesced queries, got %d", numGoroutines, stats.Coalesced)
+	}
+}
+
+func TestDriver_Singleflight_Disabled(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := sql.OpenDB(dialect.MySQL, db)
+
+	// Create driver with singleflight disabled (default)
+	cachedDrv := entcache.NewDriver(drv, entcache.WithSingleflight(false), entcache.TTL(time.Minute))
+
+	// With singleflight disabled, we expect the normal recorder pattern
+	mock.ExpectQuery("SELECT name FROM users").
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("test"))
+
+	ctx := entcache.Cache(context.Background())
+	expectQuery(ctx, t, cachedDrv, "SELECT name FROM users", []any{"test"})
+
+	// Second query should hit cache
+	expectQuery(ctx, t, cachedDrv, "SELECT name FROM users", []any{"test"})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := cachedDrv.Stats()
+	if stats.Hits != 1 {
+		t.Errorf("expected 1 hit, got %d", stats.Hits)
+	}
+	if stats.Coalesced != 0 {
+		t.Errorf("expected 0 coalesced, got %d", stats.Coalesced)
+	}
+}
+
+func TestDriver_Singleflight_ErrorPropagation(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv := sql.OpenDB(dialect.MySQL, db)
+
+	cachedDrv := entcache.NewDriver(drv, entcache.WithSingleflight(true), entcache.TTL(time.Minute))
+
+	mock.ExpectQuery("SELECT id FROM broken").
+		WillReturnError(driver.ErrBadConn).
+		WillDelayFor(50 * time.Millisecond)
+
+	ctx := entcache.Cache(context.Background())
+
+	const numGoroutines = 5
+	errors := make(chan error, numGoroutines)
+
+	for range numGoroutines {
+		go func() {
+			rows := &sql.Rows{}
+			err := cachedDrv.Query(ctx, "SELECT id FROM broken", []any{}, rows)
+			errors <- err
+		}()
+	}
+
+	// All goroutines should receive the same error
+	for range numGoroutines {
+		select {
+		case err := <-errors:
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for errors")
+		}
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expected exactly one query attempt: %v", err)
+	}
+}
+
+// runQueryAndCollect executes a query and collects all results into a slice.
+func runQueryAndCollect(ctx context.Context, drv dialect.Driver, query string) ([]any, error) {
+	rows := &sql.Rows{}
+	if err := drv.Query(ctx, query, []any{}, rows); err != nil {
+		return nil, err
+	}
+	var dest []any
+	for rows.Next() {
+		var v any
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		dest = append(dest, v)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return dest, nil
+}
+
+// collectAndVerifyResults collects results from concurrent goroutines and verifies them.
+func collectAndVerifyResults(t *testing.T, results <-chan []any, errors <-chan error, count int, expected []any) {
+	t.Helper()
+	for range count {
+		select {
+		case err := <-errors:
+			t.Fatalf("unexpected error: %v", err)
+		case result := <-results:
+			if len(result) != len(expected) {
+				t.Fatalf("mismatch rows length: %d != %d", len(result), len(expected))
+			}
+			for i := range result {
+				if result[i] != expected[i] {
+					t.Fatalf("mismatch values: %v != %v", result[i], expected[i])
+				}
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for results")
+		}
+	}
+}
